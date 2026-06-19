@@ -1,0 +1,262 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size):
+        super(ConvLSTMCell, self).__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+
+        # 定义四个门的卷积操作：输入门、遗忘门、输出门和单元状态
+        self.Wxi = nn.Conv2d(self.input_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+        self.Whi = nn.Conv2d(self.hidden_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+
+        self.Wxf = nn.Conv2d(self.input_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+        self.Whf = nn.Conv2d(self.hidden_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+
+        self.Wxc = nn.Conv2d(self.input_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+        self.Whc = nn.Conv2d(self.hidden_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+
+        self.Wxo = nn.Conv2d(self.input_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+        self.Who = nn.Conv2d(self.hidden_channels, self.hidden_channels, self.kernel_size, padding=self.padding)
+
+    def forward(self, x, h_prev, c_prev):
+        if h_prev is None:
+            batch_size, _, height, width = x.size()
+            h_prev = torch.zeros(batch_size, self.hidden_channels, height, width, device=x.device)
+            c_prev = torch.zeros(batch_size, self.hidden_channels, height, width, device=x.device)
+
+        i = torch.sigmoid(self.Wxi(x) + self.Whi(h_prev))
+        f = torch.sigmoid(self.Wxf(x) + self.Whf(h_prev))
+        c = f * c_prev + i * torch.tanh(self.Wxc(x) + self.Whc(h_prev))
+        o = torch.sigmoid(self.Wxo(x) + self.Who(h_prev))
+        h = o * torch.tanh(c)
+
+        return h, c
+
+
+class ConvLSTM(nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size, num_layers):
+        super(ConvLSTM, self).__init__()
+        self.input_channels = input_channels
+        self.hidden_channels = hidden_channels
+        self.kernel_size = kernel_size
+        self.num_layers = num_layers
+
+        cell_list = []
+        for i in range(self.num_layers):
+            cur_input_channels = self.input_channels if i == 0 else self.hidden_channels
+            cell_list.append(ConvLSTMCell(cur_input_channels, self.hidden_channels, self.kernel_size))
+
+        self.cell_list = nn.ModuleList(cell_list)
+
+    def forward(self, x, hidden_state=None):
+        """
+        x: 输入张量，形状为 (batch_size, time_steps, channels, height, width)
+        """
+        batch_size, time_steps, channels, height, width = x.size()
+
+        # 初始化隐藏状态
+        if hidden_state is None:
+            hidden_state = []
+            for i in range(self.num_layers):
+                h = torch.zeros(batch_size, self.hidden_channels, height, width, device=x.device)
+                c = torch.zeros(batch_size, self.hidden_channels, height, width, device=x.device)
+                hidden_state.append((h, c))
+
+        layer_output_list = []
+        last_state_list = []
+
+        # 循环处理每一层
+        cur_layer_input = x
+        for layer_idx in range(self.num_layers):
+            h, c = hidden_state[layer_idx]
+            output_inner = []
+
+            for t in range(time_steps):
+                h, c = self.cell_list[layer_idx](cur_layer_input[:, t, :, :, :], h, c)
+                output_inner.append(h)
+
+            layer_output = torch.stack(output_inner, dim=1)
+            cur_layer_input = layer_output
+
+            layer_output_list.append(layer_output)
+            last_state_list.append((h, c))
+
+        return layer_output_list, last_state_list
+
+
+class Model(nn.Module):
+    def __init__(self, configs=None, time_steps=10, channels_per_step=38, hidden_channels=128, kernel_size=3, num_layers=3,
+                 num_classes=1):  # hidden_channels=64
+        super(Model, self).__init__()
+
+        self.time_steps = time_steps
+        self.channels_per_step = channels_per_step
+
+        # ConvLSTM层：每个时间步的输入通道数为channels_per_step
+        self.convlstm = ConvLSTM(
+            input_channels=channels_per_step,
+            hidden_channels=hidden_channels,
+            kernel_size=kernel_size,
+            num_layers=num_layers
+        )
+
+        # 用于分类的全连接层
+        self.fc1 = nn.Linear(hidden_channels, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x, x_mark_enc=None, x_mark_dec=None, mask=None, burn_history=None):
+        """
+        x: 输入数据，形状为(batch_size, channels, height, width)
+        其中channels = time_steps * channels_per_step
+        """
+        batch_size, temporal, channels, height, width = x.size()
+
+        # 将输入重新组织为(batch_size, time_steps, channels_per_step, height, width)
+        # x = x.view(batch_size, self.time_steps, self.channels_per_step, height, width)
+
+        # 通过ConvLSTM处理
+        _, last_states = self.convlstm(x)
+
+        # 获取最后一层的隐藏状态
+        h, _ = last_states[-1]  # h shape: [batch_size, hidden_channels, height, width]
+
+        # 全局平均池化
+        h = F.adaptive_avg_pool2d(h, (1, 1)).view(batch_size, -1)
+
+        # 分类层
+        h = F.relu(self.fc1(h))
+        h = self.dropout(h)
+        h = self.fc2(h)
+
+        return h
+
+
+# 示例：如何使用该骨干网络
+def example_usage():
+    # 创建一个ConvLSTM骨干网络实例
+    # 假设我们处理23个时间步，每个时间步6个通道，10个分类类别
+    model = Model(
+        time_steps=23,
+        channels_per_step=6,
+        hidden_channels=64,
+        kernel_size=3,
+        num_layers=3,
+        num_classes=10
+    )
+
+    # 创建一个样本输入，形状为[batch_size, time_steps*channels_per_step, height, width]
+    batch_size = 16
+    total_channels = 23 * 6  # 23个时间步，每步6个通道
+    height, width = 13, 13
+    dummy_input = torch.randn(batch_size, total_channels, height, width)
+
+    # 前向传播
+    outputs = model(dummy_input)
+
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {outputs.shape}")  # 应该是[batch_size, num_classes]
+
+    return model
+
+
+if __name__ == '__main__':
+    import time
+    try:
+        from thop import profile, clever_format
+        has_thop = True
+    except ImportError:
+        has_thop = False
+        print("警告: 未安装thop库，无法计算FLOPs，请运行: pip install thop")
+    
+    print("=== ConvLSTM 模型性能测试 ===")
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 模型参数 (参考 our_model.py 中的配置)
+    batch_size = 1024
+    num_bands = 138
+    patch_size = 13
+    num_classes = 11
+    hidden_dim = 138
+    
+    # 创建模型
+    model = ConvLSTM(
+        input_channels=num_bands,
+        hidden_channels=hidden_dim,
+        kernel_size=3,
+        num_layers=2,
+        num_classes=num_classes
+    ).to(device)
+    
+    # 创建输入数据
+    x = torch.randn(batch_size, num_bands, patch_size, patch_size).to(device)
+    print(f"输入数据形状: {x.shape}")
+    
+    # 计算模型参数量
+    print("\n=== 模型复杂度分析 ===")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
+    
+    # 计算FLOPs (如果可用)
+    if has_thop:
+        try:
+            flops, params = profile(model, inputs=(x,), verbose=False)
+            flops, params = clever_format([flops, params], "%.3f")
+            print(f"参数量 (thop): {params}")
+            print(f"FLOPs: {flops}")
+            
+            # 计算GFLOPs
+            flops_num = profile(model, inputs=(x,), verbose=False)[0]
+            gflops = flops_num / 1e9
+            print(f"GFLOPs: {gflops:.3f}")
+        except Exception as e:
+            print(f"FLOPs计算失败: {e}")
+    
+    # 测试推理速度
+    print("\n=== 推理性能测试 ===")
+    model.eval()
+    num_runs = 10
+    
+    # 预热
+    with torch.no_grad():
+        for _ in range(3):
+            _ = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+    
+    # 正式测试
+    with torch.no_grad():
+        start_time = time.time()
+        for _ in range(num_runs):
+            output = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        end_time = time.time()
+    
+    inference_time = (end_time - start_time) / num_runs
+    throughput = batch_size / inference_time
+    
+    print(f"推理时间: {inference_time:.4f} 秒/批次")
+    print(f"吞吐量: {throughput:.2f} 样本/秒")
+    print(f"输出形状: {output.shape}")
+    
+    # 内存使用情况
+    if device.type == 'cuda':
+        memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+        memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
+        print(f"\n=== GPU内存使用 ===")
+        print(f"已分配: {memory_allocated:.2f} GB")
+        print(f"已保留: {memory_reserved:.2f} GB")
+    
+    print("\n=== 测试完成 ===")

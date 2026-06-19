@@ -1,0 +1,151 @@
+import torch
+import torch.nn as nn
+
+
+class Model(nn.Module):
+    def __init__(self, configs=None, input_size=38 * 13 * 13, num_classes=1, hidden_dim=256, gru_layers=2):
+        """
+        Args:
+            input_size: 展平后每个时间步的特征维度 (6*H*W)
+            num_classes: 分类类别数
+            hidden_dim: GRU隐藏层维度
+            gru_layers: GRU层数
+        """
+        super(Model, self).__init__()
+
+        # 展平空间维度
+        self.flatten = nn.Flatten(start_dim=2)
+
+        # 线性嵌入层（降维到128）
+        self.embedding = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3)
+        )
+
+        # GRU层
+        self.gru = nn.GRU(
+            input_size=128,
+            hidden_size=hidden_dim,
+            num_layers=gru_layers,
+            batch_first=True,
+            dropout=0.2 if gru_layers > 1 else 0  # 多层时添加Dropout
+        )
+
+        # 分类器
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(hidden_dim // 2, num_classes)
+        )
+
+    def forward(self, x, x_mark_enc=None, x_mark_dec=None, mask=None, burn_history=None):
+        B, T, C, H, W = x.shape
+
+        # 1. 重塑并展平 (B, 23, 6*H*W)
+        # x = x.view(B, T, C, H, W)
+        # x = self.flatten(x)
+        x = x[:, :, :, H//2, W//2]
+        # 2. 嵌入降维 (B, 23, 128)
+        x = self.embedding(x)
+
+        # 3. GRU处理 (B, 23, hidden_dim)
+        gru_out, _ = self.gru(x)
+
+        # 4. 取最后时间步 (B, hidden_dim)
+        last_output = gru_out[:, -1, :]
+
+        # 5. 分类
+        return self.classifier(last_output)
+
+
+# 测试代码
+if __name__ == '__main__':
+    import time
+    try:
+        from thop import profile, clever_format
+        has_thop = True
+    except ImportError:
+        has_thop = False
+        print("警告: 未安装thop库，无法计算FLOPs，请运行: pip install thop")
+    
+    print("=== GRU 模型性能测试 ===")
+    
+    # 设置设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 模型参数 (参考 our_model.py 中的配置)
+    batch_size = 1024
+    num_bands = 138
+    patch_size = 13
+    num_classes = 11
+    hidden_dim = 138
+    
+    # 创建模型
+    model = Model(num_classes=num_classes).to(device)
+    
+    # 创建输入数据
+    x = torch.randn(batch_size, num_bands, patch_size, patch_size).to(device)
+    print(f"输入数据形状: {x.shape}")
+    
+    # 计算模型参数量
+    print("\n=== 模型复杂度分析 ===")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"总参数量: {total_params:,}")
+    print(f"可训练参数量: {trainable_params:,}")
+    
+    # 计算FLOPs (如果可用)
+    if has_thop:
+        try:
+            flops, params = profile(model, inputs=(x,), verbose=False)
+            flops, params = clever_format([flops, params], "%.3f")
+            print(f"参数量 (thop): {params}")
+            print(f"FLOPs: {flops}")
+            
+            # 计算GFLOPs
+            flops_num = profile(model, inputs=(x,), verbose=False)[0]
+            gflops = flops_num / 1e9
+            print(f"GFLOPs: {gflops:.3f}")
+        except Exception as e:
+            print(f"FLOPs计算失败: {e}")
+    
+    # 测试推理速度
+    print("\n=== 推理性能测试 ===")
+    model.eval()
+    num_runs = 10
+    
+    # 预热
+    with torch.no_grad():
+        for _ in range(3):
+            _ = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+    
+    # 正式测试
+    with torch.no_grad():
+        start_time = time.time()
+        for _ in range(num_runs):
+            output = model(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        end_time = time.time()
+    
+    inference_time = (end_time - start_time) / num_runs
+    throughput = batch_size / inference_time
+    
+    print(f"推理时间: {inference_time:.4f} 秒/批次")
+    print(f"吞吐量: {throughput:.2f} 样本/秒")
+    print(f"输出形状: {output.shape}")
+    
+    # 内存使用情况
+    if device.type == 'cuda':
+        memory_allocated = torch.cuda.memory_allocated(device) / 1024**3
+        memory_reserved = torch.cuda.memory_reserved(device) / 1024**3
+        print(f"\n=== GPU内存使用 ===")
+        print(f"已分配: {memory_allocated:.2f} GB")
+        print(f"已保留: {memory_reserved:.2f} GB")
+    
+    print("\n=== 测试完成 ===")
